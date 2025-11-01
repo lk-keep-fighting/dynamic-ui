@@ -33,9 +33,16 @@ npm run dev
 创建 `.env.local` 并根据需要添加：
 
 ```bash
-# OpenAI（可选）
+# OpenAI / 兼容 OpenAI 接口的供应商（可选）
 OPENAI_API_KEY=your-openai-api-key
 OPENAI_MODEL=gpt-4o-mini # 可选，默认 gpt-4o-mini
+
+# 若使用兼容 OpenAI 的第三方供应商，可按需覆盖以下变量
+# （也可使用 AI_API_* 前缀，配置方式相同）
+OPENAI_BASE_URL=https://api.your-provider.com/v1
+OPENAI_COMPAT_ENDPOINT=chat/completions   # 默认使用 responses
+OPENAI_API_KEY_HEADER=api-key             # 默认 Authorization
+OPENAI_ADDITIONAL_HEADERS={"HTTP-Referer":"https://example.com"}
 
 # Supabase（可选，用于记录对话与生成结果）
 NEXT_PUBLIC_SUPABASE_URL=https://xxxx.supabase.co

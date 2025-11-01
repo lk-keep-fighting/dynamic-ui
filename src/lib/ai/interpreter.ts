@@ -392,24 +392,73 @@ export class MockAiInterpreter implements AiInterpreter {
   }
 }
 
+const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
+const DEFAULT_OPENAI_ENDPOINT = "responses";
+
+type OpenAiInterpreterOptions = {
+  apiKey: string;
+  model?: string;
+  baseUrl?: string;
+  endpoint?: string;
+  apiKeyHeader?: string;
+  organization?: string;
+  project?: string;
+  extraHeaders?: Record<string, string>;
+};
+
 export class OpenAiInterpreter implements AiInterpreter {
-  constructor(private apiKey: string, private model = process.env.OPENAI_MODEL ?? "gpt-4o-mini") {}
+  private readonly apiKey: string;
+  private readonly model: string;
+  private readonly baseUrl: string;
+  private readonly endpoint: string;
+  private readonly apiKeyHeader: string;
+  private readonly organization?: string;
+  private readonly project?: string;
+  private readonly extraHeaders: Record<string, string>;
+
+  constructor(options: OpenAiInterpreterOptions) {
+    this.apiKey = options.apiKey;
+    this.model = options.model ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini";
+    const baseUrl = (options.baseUrl ?? process.env.OPENAI_BASE_URL ?? DEFAULT_OPENAI_BASE_URL).trim();
+    this.baseUrl = baseUrl.replace(/\/$/, "");
+    const endpoint = (options.endpoint ?? process.env.OPENAI_COMPAT_ENDPOINT ?? DEFAULT_OPENAI_ENDPOINT).trim();
+    this.endpoint = endpoint.replace(/^\//, "");
+    this.apiKeyHeader = (options.apiKeyHeader ?? process.env.OPENAI_API_KEY_HEADER ?? "Authorization").trim();
+    this.organization = options.organization ?? process.env.OPENAI_ORG ?? process.env.OPENAI_ORGANIZATION;
+    this.project = options.project ?? process.env.OPENAI_PROJECT;
+    this.extraHeaders = options.extraHeaders ?? {};
+  }
 
   async interpret(messages: ConversationMessage[]): Promise<BusinessAppRuntimePayload> {
-    const response = await fetch("https://api.openai.com/v1/responses", {
+    const isChatCompletions = this.endpoint.includes("chat/completions");
+    const url = `${this.baseUrl}/${this.endpoint}`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...this.extraHeaders,
+    };
+
+    if (this.apiKeyHeader.toLowerCase() === "authorization") {
+      headers.Authorization = `Bearer ${this.apiKey}`;
+    } else {
+      headers[this.apiKeyHeader] = this.apiKey;
+    }
+
+    if (this.organization) {
+      headers["OpenAI-Organization"] = this.organization;
+    }
+
+    if (this.project) {
+      headers["OpenAI-Project"] = this.project;
+    }
+
+    const payload = isChatCompletions
+      ? this.buildChatCompletionsPayload(messages)
+      : this.buildResponsesPayload(messages);
+
+    const response = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.model,
-        input: this.buildPrompt(messages),
-        response_format: {
-          type: "json_schema",
-          json_schema: BUSINESS_APP_JSON_SCHEMA,
-        },
-      }),
+      headers,
+      body: JSON.stringify(payload),
     });
 
     if (!response.ok) {
@@ -417,22 +466,42 @@ export class OpenAiInterpreter implements AiInterpreter {
     }
 
     const json = await response.json();
-    const textOutput = json?.output?.[0]?.content?.[0]?.text ?? json?.output_text ?? json?.choices?.[0]?.message?.content;
-    if (!textOutput || typeof textOutput !== "string") {
+    const textOutput = this.extractJsonText(json);
+    if (!textOutput) {
       throw new Error("OpenAI 返回内容为空");
     }
+
     const parsed = JSON.parse(textOutput);
     return businessAppZod.parse(parsed);
   }
 
-  private buildPrompt(messages: ConversationMessage[]) {
-    const catalogSummary = componentCatalog
-      .map((component) => `${component.name}: ${component.description}。适用场景：${component.bestFor.join("、")}`)
-      .join("\n");
+  private buildResponsesPayload(messages: ConversationMessage[]) {
+    return {
+      model: this.model,
+      input: this.buildResponsesInput(messages),
+      response_format: {
+        type: "json_schema",
+        json_schema: BUSINESS_APP_JSON_SCHEMA,
+      },
+    };
+  }
 
-    const systemMessage = `你是一名企业中台体验设计师，根据用户的业务描述生成数据模型(schema)、业务操作(schema)以及交互模式(pattern)。\n请参考以下预制组件，并在输出中选择最适合的组件组合：\n${catalogSummary}\n输出需要严格符合 BusinessAppRuntime JSON Schema。`;
+  private buildChatCompletionsPayload(messages: ConversationMessage[]) {
+    return {
+      model: this.model,
+      messages: this.buildChatMessages(messages),
+      response_format: {
+        type: "json_schema",
+        json_schema: BUSINESS_APP_JSON_SCHEMA,
+      },
+    };
+  }
 
-    const inputMessages = [
+  private buildResponsesInput(messages: ConversationMessage[]) {
+    const catalogSummary = this.buildCatalogSummary();
+    const systemMessage = this.buildSystemInstruction(catalogSummary);
+
+    return [
       {
         role: "system",
         content: [{ type: "text", text: systemMessage }],
@@ -442,16 +511,109 @@ export class OpenAiInterpreter implements AiInterpreter {
         content: [{ type: "text", text: message.content }],
       })),
     ];
+  }
 
-    return inputMessages;
+  private buildChatMessages(messages: ConversationMessage[]) {
+    const catalogSummary = this.buildCatalogSummary();
+    const systemMessage = this.buildSystemInstruction(catalogSummary);
+
+    return [
+      {
+        role: "system",
+        content: systemMessage,
+      },
+      ...messages.map((message) => ({
+        role: message.role,
+        content: message.content,
+      })),
+    ];
+  }
+
+  private buildCatalogSummary() {
+    return componentCatalog
+      .map((component) => `${component.name}: ${component.description}。适用场景：${component.bestFor.join("、")}`)
+      .join("\n");
+  }
+
+  private buildSystemInstruction(catalogSummary: string) {
+    return `你是一名企业中台体验设计师，根据用户的业务描述生成数据模型(schema)、业务操作(schema)以及交互模式(pattern)。\n请参考以下预制组件，并在输出中选择最适合的组件组合：\n${catalogSummary}\n输出需要严格符合 BusinessAppRuntime JSON Schema。`;
+  }
+
+  private extractJsonText(response: any): string | null {
+    if (!response) return null;
+
+    const fromResponses = response?.output?.[0]?.content?.[0]?.text;
+    if (typeof fromResponses === "string" && fromResponses.trim()) {
+      return fromResponses;
+    }
+
+    if (typeof response?.output_text === "string" && response.output_text.trim()) {
+      return response.output_text;
+    }
+
+    const choices = response?.choices;
+    if (Array.isArray(choices) && choices.length > 0) {
+      const firstChoice = choices[0];
+      const messageContent = firstChoice?.message?.content;
+
+      if (typeof messageContent === "string" && messageContent.trim()) {
+        return messageContent;
+      }
+
+      if (Array.isArray(messageContent)) {
+        const textPart = messageContent.find((part: any) => part?.type === "text" && typeof part?.text === "string");
+        if (textPart?.text?.trim()) {
+          return textPart.text;
+        }
+      }
+
+      if (typeof firstChoice?.text === "string" && firstChoice.text.trim()) {
+        return firstChoice.text;
+      }
+    }
+
+    return null;
   }
 }
 
+function parseAdditionalHeaders(value?: string | null): Record<string, string> | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const headers: Record<string, string> = {};
+      Object.entries(parsed).forEach(([key, val]) => {
+        if (typeof val === "string") {
+          headers[key] = val;
+        } else if (val !== undefined && val !== null) {
+          headers[key] = JSON.stringify(val);
+        }
+      });
+      return headers;
+    }
+  } catch (error) {
+    console.warn("Failed to parse AI additional headers", error);
+  }
+  return undefined;
+}
+
 export async function interpretConversation(messages: ConversationMessage[]): Promise<BusinessAppRuntimePayload> {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = process.env.OPENAI_API_KEY ?? process.env.AI_API_KEY;
   if (apiKey) {
     try {
-      const interpreter = new OpenAiInterpreter(apiKey);
+      const interpreter = new OpenAiInterpreter({
+        apiKey,
+        model: process.env.OPENAI_MODEL ?? process.env.AI_MODEL,
+        baseUrl: process.env.OPENAI_BASE_URL ?? process.env.AI_API_BASE_URL,
+        endpoint: process.env.OPENAI_COMPAT_ENDPOINT ?? process.env.AI_API_ENDPOINT,
+        apiKeyHeader: process.env.OPENAI_API_KEY_HEADER ?? process.env.AI_API_KEY_HEADER,
+        organization: process.env.OPENAI_ORG ?? process.env.OPENAI_ORGANIZATION,
+        project: process.env.OPENAI_PROJECT,
+        extraHeaders:
+          parseAdditionalHeaders(process.env.OPENAI_ADDITIONAL_HEADERS) ??
+          parseAdditionalHeaders(process.env.AI_API_ADDITIONAL_HEADERS) ??
+          {},
+      });
       return await interpreter.interpret(messages);
     } catch (error) {
       console.error("OpenAI interpreter failed, fallback to mock.", error);
